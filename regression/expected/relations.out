@@ -168,9 +168,9 @@ SELECT query, relations from pg_stat_monitor ORDER BY query collate "C";
              query              |                                           relations                                           
 --------------------------------+-----------------------------------------------------------------------------------------------
  SELECT * FROM v1               | {public.v1*,public.foo1}
- SELECT * FROM v1,v2            | {public.v1*,public.foo1,public.v2*,public.foo2}
- SELECT * FROM v1,v2,v3         | {public.v1*,public.foo1,public.v2*,public.foo2,public.v3*,public.foo3}
- SELECT * FROM v1,v2,v3,v4      | {public.v1*,public.foo1,public.v2*,public.foo2,public.v3*,public.foo3,public.v4*,public.foo4}
+ SELECT * FROM v1,v2            | {public.v1*,public.v2*,public.foo1,public.foo2}
+ SELECT * FROM v1,v2,v3         | {public.v1*,public.v2*,public.v3*,public.foo1,public.foo2,public.foo3}
+ SELECT * FROM v1,v2,v3,v4      | {public.v1*,public.v2*,public.v3*,public.v4*,public.foo1,public.foo2,public.foo3,public.foo4}
  SELECT pg_stat_monitor_reset() | 
 (5 rows)
 
@@ -184,6 +184,119 @@ DROP VIEW v1;
 DROP VIEW v2;
 DROP VIEW v3;
 DROP VIEW v4;
+-- test that the outer entry records its own relations under nested execution
+INSERT INTO foo1 VALUES (1);
+INSERT INTO foo2 VALUES (10);
+CREATE FUNCTION inner_fn() RETURNS int LANGUAGE plpgsql AS $$
+DECLARE x int;
+BEGIN
+    SELECT b INTO x FROM foo2 LIMIT 1;
+    RETURN x;
+END;
+$$;
+SET pg_stat_monitor.pgsm_track = 'top';
+SELECT pg_stat_monitor_reset();
+ pg_stat_monitor_reset 
+-----------------------
+ 
+(1 row)
+
+SELECT a, inner_fn() FROM foo1;
+ a | inner_fn 
+---+----------
+ 1 |       10
+(1 row)
+
+SELECT query, relations FROM pg_stat_monitor WHERE query LIKE 'SELECT a, inner_fn()%' ORDER BY query collate "C";
+             query              |   relations   
+--------------------------------+---------------
+ SELECT a, inner_fn() FROM foo1 | {public.foo1}
+(1 row)
+
+SET pg_stat_monitor.pgsm_track = 'all';
+SELECT pg_stat_monitor_reset();
+ pg_stat_monitor_reset 
+-----------------------
+ 
+(1 row)
+
+SELECT a, inner_fn() FROM foo1;
+ a | inner_fn 
+---+----------
+ 1 |       10
+(1 row)
+
+SELECT query, relations FROM pg_stat_monitor WHERE query LIKE 'SELECT %FROM foo%' ORDER BY query collate "C";
+               query               |   relations   
+-----------------------------------+---------------
+ SELECT a, inner_fn() FROM foo1    | {public.foo1}
+ SELECT b        FROM foo2 LIMIT 1 | {public.foo2}
+(2 rows)
+
+RESET pg_stat_monitor.pgsm_track;
+DROP FUNCTION inner_fn();
+-- test that a query that errors during execution still records its relations
+INSERT INTO foo1 VALUES (0);
+SELECT pg_stat_monitor_reset();
+ pg_stat_monitor_reset 
+-----------------------
+ 
+(1 row)
+
+SELECT 1/a FROM foo1;
+ERROR:  division by zero
+SELECT decode_error_level(elevel), query, relations FROM pg_stat_monitor WHERE elevel > 0 ORDER BY query collate "C";
+ decode_error_level |         query         |   relations   
+--------------------+-----------------------+---------------
+ ERROR              | SELECT 1/a FROM foo1; | {public.foo1}
+(1 row)
+
+DELETE FROM foo1 WHERE a = 0;
+-- test that a permission error also records the relations the query referenced
+CREATE ROLE pgsm_relations_role;
+SELECT pg_stat_monitor_reset();
+ pg_stat_monitor_reset 
+-----------------------
+ 
+(1 row)
+
+SET ROLE pgsm_relations_role;
+SELECT * FROM foo1;
+ERROR:  permission denied for table foo1
+RESET ROLE;
+SELECT decode_error_level(elevel), query, relations FROM pg_stat_monitor WHERE elevel > 0 ORDER BY query collate "C";
+ decode_error_level |        query        |   relations   
+--------------------+---------------------+---------------
+ ERROR              | SELECT * FROM foo1; | {public.foo1}
+(1 row)
+
+DROP ROLE pgsm_relations_role;
+-- test that a subquery in FROM does not produce a malformed relation entry
+SELECT pg_stat_monitor_reset();
+ pg_stat_monitor_reset 
+-----------------------
+ 
+(1 row)
+
+SELECT * FROM (SELECT 1) sub;
+ ?column? 
+----------
+        1
+(1 row)
+
+SELECT * FROM foo1, (SELECT 1) sub;
+ a | ?column? 
+---+----------
+ 1 |        1
+(1 row)
+
+SELECT query, relations FROM pg_stat_monitor WHERE query LIKE 'SELECT % sub%' ORDER BY query collate "C";
+               query                |   relations   
+------------------------------------+---------------
+ SELECT * FROM (SELECT 1) sub       | 
+ SELECT * FROM foo1, (SELECT 1) sub | {public.foo1}
+(2 rows)
+
 DROP TABLE foo1;
 DROP TABLE foo2;
 DROP TABLE foo3;

@@ -112,9 +112,6 @@ static int64 *nested_queryids;
 static char **nested_query_txts;
 static List *lentries = NIL;
 
-static char relations[REL_LST][REL_LEN];
-
-static int	num_relations;		/* Number of relation in the query */
 static bool system_init = false;
 static struct rusage rusage_start;
 static struct rusage rusage_end;
@@ -154,7 +151,6 @@ static emit_log_hook_type prev_emit_log_hook = NULL;
 
 DECLARE_HOOK(void pgsm_emit_log_hook, ErrorData *edata);
 static shmem_startup_hook_type prev_shmem_startup_hook = NULL;
-static ExecutorCheckPerms_hook_type prev_ExecutorCheckPerms_hook = NULL;
 
 PG_FUNCTION_INFO_V1(pg_stat_monitor_version);
 PG_FUNCTION_INFO_V1(pg_stat_monitor_reset);
@@ -180,11 +176,6 @@ DECLARE_HOOK(void pgsm_ExecutorRun, QueryDesc *queryDesc, ScanDirection directio
 #endif
 DECLARE_HOOK(void pgsm_ExecutorFinish, QueryDesc *queryDesc);
 DECLARE_HOOK(void pgsm_ExecutorEnd, QueryDesc *queryDesc);
-#if PG_VERSION_NUM < 160000
-DECLARE_HOOK(bool pgsm_ExecutorCheckPerms, List *rt, bool abort);
-#else
-DECLARE_HOOK(bool pgsm_ExecutorCheckPerms, List *rt, List *rp, bool abort);
-#endif
 
 DECLARE_HOOK(PlannedStmt *pgsm_planner_hook, Query *parse, const char *query_string, int cursorOptions, ParamListInfo boundParams);
 DECLARE_HOOK(void pgsm_ProcessUtility, PlannedStmt *pstmt, const char *queryString,
@@ -316,8 +307,6 @@ _PG_init(void)
 	planner_hook = HOOK(pgsm_planner_hook);
 	prev_emit_log_hook = emit_log_hook;
 	emit_log_hook = HOOK(pgsm_emit_log_hook);
-	prev_ExecutorCheckPerms_hook = ExecutorCheckPerms_hook;
-	ExecutorCheckPerms_hook = HOOK(pgsm_ExecutorCheckPerms);
 
 	nested_queryids = (int64 *) malloc(sizeof(int64) * max_stack_depth);
 	nested_query_txts = (char **) calloc(max_stack_depth, sizeof(char *));
@@ -509,8 +498,82 @@ pgsm_post_parse_analyze(ParseState *pstate, Query *query, JumbleState *jstate)
 static void
 pgsm_ExecutorStart(QueryDesc *queryDesc, int eflags)
 {
+	/*
+	 * Skip queries with queryId zero. This prevents double counting of
+	 * optimizable statements that are directly contained in utility
+	 * statements.
+	 */
+	bool		track = pgsm_enabled(nesting_level) &&
+		queryDesc->plannedstmt->queryId != INT64CONST(0);
+
 	if (getrusage(RUSAGE_SELF, &rusage_start) != 0)
 		elog(DEBUG1, "[pg_stat_monitor] pgsm_ExecutorStart: failed to execute getrusage.");
+
+	/*
+	 * Populate the local entry's relations from the range table before
+	 * standard_ExecutorStart() runs. Permission checking happens
+	 * inside standard_ExecutorStart() and can throw. If it does,
+	 * pgsm_store_error() reads the populated relations off the top of
+	 * local_entries when recording the error row.
+	 */
+	if (track)
+	{
+		pgsmEntry  *entry;
+
+		entry = pgsm_get_entry_for_query(queryDesc->plannedstmt->queryId, NULL,
+										 queryDesc->sourceText,
+										 strlen(queryDesc->sourceText),
+										 true, queryDesc->operation);
+		if (entry)
+		{
+			ListCell   *lr;
+			int			i = 0;
+			Oid			list_oid[REL_LST];
+
+			foreach(lr, queryDesc->plannedstmt->rtable)
+			{
+				RangeTblEntry *rte = lfirst(lr);
+				bool		seen = false;
+
+				/*
+				 * Keep only range table entries that name a relation.
+				 * They come in two forms. RTE_RELATION covers normal
+				 * relations and views in PG <16. RTE_SUBQUERY with
+				 * relid and relkind populated covers views in PG 16+.
+				 */
+				if (rte->rtekind != RTE_RELATION &&
+					!(rte->rtekind == RTE_SUBQUERY && rte->relkind == 'v'))
+					continue;
+
+				if (i >= REL_LST)
+					break;
+
+				for (int k = 0; k < i; k++)
+				{
+					if (list_oid[k] == rte->relid)
+					{
+						seen = true;
+						break;
+					}
+				}
+
+				if (seen)
+					continue;
+
+				list_oid[i] = rte->relid;
+				if (rte->relkind == 'v')
+					snprintf(entry->counters.info.relations[i], REL_LEN, "%s.%s*",
+							 get_namespace_name(get_rel_namespace(rte->relid)),
+							 get_rel_name(rte->relid));
+				else
+					snprintf(entry->counters.info.relations[i], REL_LEN, "%s.%s",
+							 get_namespace_name(get_rel_namespace(rte->relid)),
+							 get_rel_name(rte->relid));
+				i++;
+			}
+			entry->counters.info.num_relations = i;
+		}
+	}
 
 	if (prev_ExecutorStart)
 		prev_ExecutorStart(queryDesc, eflags);
@@ -518,26 +581,18 @@ pgsm_ExecutorStart(QueryDesc *queryDesc, int eflags)
 		standard_ExecutorStart(queryDesc, eflags);
 
 	/*
-	 * If query has queryId zero, don't track it.  This prevents double
-	 * counting of optimizable statements that are directly contained in
-	 * utility statements.
+	 * Set up to track total elapsed time in ExecutorRun. The space must
+	 * be allocated in queryDesc->estate->es_query_cxt, which is created
+	 * by standard_ExecutorStart() above, so this stanza has to run after
+	 * that call.
 	 */
-	if (pgsm_enabled(nesting_level) &&
-		queryDesc->plannedstmt->queryId != INT64CONST(0))
+	if (track && queryDesc->totaltime == NULL)
 	{
-		/*
-		 * Set up to track total elapsed time in ExecutorRun.  Make sure the
-		 * space is allocated in the per-query context so it will go away at
-		 * ExecutorEnd.
-		 */
-		if (queryDesc->totaltime == NULL)
-		{
-			MemoryContext oldcxt;
+		MemoryContext oldcxt;
 
-			oldcxt = MemoryContextSwitchTo(queryDesc->estate->es_query_cxt);
-			queryDesc->totaltime = InstrAlloc(1, INSTRUMENT_ALL, false);
-			MemoryContextSwitchTo(oldcxt);
-		}
+		oldcxt = MemoryContextSwitchTo(queryDesc->estate->es_query_cxt);
+		queryDesc->totaltime = InstrAlloc(1, INSTRUMENT_ALL, false);
+		MemoryContextSwitchTo(oldcxt);
 	}
 }
 
@@ -755,70 +810,6 @@ pgsm_ExecutorEnd(QueryDesc *queryDesc)
 		standard_ExecutorEnd(queryDesc);
 
 	pgsm_delete_entry(queryDesc->plannedstmt->queryId);
-
-	num_relations = 0;
-}
-
-static bool
-#if PG_VERSION_NUM < 160000
-pgsm_ExecutorCheckPerms(List *rt, bool abort)
-#else
-pgsm_ExecutorCheckPerms(List *rt, List *rp, bool abort)
-#endif
-{
-	ListCell   *lr = NULL;
-	int			i = 0;
-	int			j = 0;
-	Oid			list_oid[20];
-
-	num_relations = 0;
-
-	foreach(lr, rt)
-	{
-		RangeTblEntry *rte = lfirst(lr);
-
-		if (rte->rtekind != RTE_RELATION
-#if PG_VERSION_NUM >= 160000
-			&& (rte->rtekind != RTE_SUBQUERY && rte->relkind != 'v')
-#endif
-			)
-			continue;
-
-		if (i < REL_LST)
-		{
-			bool		found = false;
-
-			for (j = 0; j < i; j++)
-			{
-				if (list_oid[j] == rte->relid)
-					found = true;
-			}
-
-			if (!found)
-			{
-				char	   *namespace_name;
-				char	   *relation_name;
-
-				list_oid[j] = rte->relid;
-				namespace_name = get_namespace_name(get_rel_namespace(rte->relid));
-				relation_name = get_rel_name(rte->relid);
-				if (rte->relkind == 'v')
-					snprintf(relations[i++], REL_LEN, "%s.%s*", namespace_name, relation_name);
-				else
-					snprintf(relations[i++], REL_LEN, "%s.%s", namespace_name, relation_name);
-			}
-		}
-	}
-	num_relations = i;
-
-	if (prev_ExecutorCheckPerms_hook)
-#if PG_VERSION_NUM < 160000
-		return prev_ExecutorCheckPerms_hook(rt, abort);
-#else
-		return prev_ExecutorCheckPerms_hook(rt, rp, abort);
-#endif
-
-	return true;
 }
 
 static PlannedStmt *
@@ -1399,10 +1390,6 @@ pgsm_update_entry(pgsmEntry *entry,
 		if (pgsm_track_application_names && app_name_len > 0 && !entry->counters.info.application_name[0])
 			strlcpy(entry->counters.info.application_name, app_name, APPLICATIONNAME_LEN);
 
-		entry->counters.info.num_relations = num_relations;
-		for (int i = 0; i < num_relations; i++)
-			strlcpy(entry->counters.info.relations[i], relations[i], REL_LEN);
-
 		if (nesting_level > 0 && nesting_level < max_stack_depth && entry->key.parentid != 0 && pgsm_track == PGSM_TRACK_ALL)
 		{
 			if (!DsaPointerIsValid(entry->counters.info.parent_query))
@@ -1573,6 +1560,16 @@ pgsm_store_error(const char *query, ErrorData *edata)
 	entry->query_text.query_pointer = pnstrdup(query, len);
 
 	entry->pgsm_query_id = get_pgsm_query_id_hash(query, len);
+
+	if (lentries != NIL)
+	{
+		pgsmEntry  *top = (pgsmEntry *) llast(lentries);
+
+		entry->counters.info.num_relations = top->counters.info.num_relations;
+		for (int i = 0; i < top->counters.info.num_relations; i++)
+			strlcpy(entry->counters.info.relations[i],
+					top->counters.info.relations[i], REL_LEN);
+	}
 
 	entry->counters.error.elevel = edata->elevel;
 	snprintf(entry->counters.error.message, ERROR_MESSAGE_LEN, "%s", edata->message);
@@ -1953,6 +1950,11 @@ pgsm_store(pgsmEntry *entry)
 		shared_hash_entry->encoding = entry->encoding;
 		shared_hash_entry->counters.info.cmd_type = entry->counters.info.cmd_type;
 		shared_hash_entry->counters.info.parent_query = InvalidDsaPointer;
+
+		shared_hash_entry->counters.info.num_relations = entry->counters.info.num_relations;
+		for (int i = 0; i < entry->counters.info.num_relations; i++)
+			strlcpy(shared_hash_entry->counters.info.relations[i],
+					entry->counters.info.relations[i], REL_LEN);
 
 		snprintf(shared_hash_entry->datname, sizeof(shared_hash_entry->datname), "%s", entry->datname);
 		snprintf(shared_hash_entry->username, sizeof(shared_hash_entry->username), "%s", entry->username);

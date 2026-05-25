@@ -60,6 +60,52 @@ DROP VIEW v2;
 DROP VIEW v3;
 DROP VIEW v4;
 
+-- test that the outer entry records its own relations under nested execution
+INSERT INTO foo1 VALUES (1);
+INSERT INTO foo2 VALUES (10);
+CREATE FUNCTION inner_fn() RETURNS int LANGUAGE plpgsql AS $$
+DECLARE x int;
+BEGIN
+    SELECT b INTO x FROM foo2 LIMIT 1;
+    RETURN x;
+END;
+$$;
+
+SET pg_stat_monitor.pgsm_track = 'top';
+SELECT pg_stat_monitor_reset();
+SELECT a, inner_fn() FROM foo1;
+SELECT query, relations FROM pg_stat_monitor WHERE query LIKE 'SELECT a, inner_fn()%' ORDER BY query collate "C";
+
+SET pg_stat_monitor.pgsm_track = 'all';
+SELECT pg_stat_monitor_reset();
+SELECT a, inner_fn() FROM foo1;
+SELECT query, relations FROM pg_stat_monitor WHERE query LIKE 'SELECT %FROM foo%' ORDER BY query collate "C";
+
+RESET pg_stat_monitor.pgsm_track;
+DROP FUNCTION inner_fn();
+
+-- test that a query that errors during execution still records its relations
+INSERT INTO foo1 VALUES (0);
+SELECT pg_stat_monitor_reset();
+SELECT 1/a FROM foo1;
+SELECT decode_error_level(elevel), query, relations FROM pg_stat_monitor WHERE elevel > 0 ORDER BY query collate "C";
+DELETE FROM foo1 WHERE a = 0;
+
+-- test that a permission error also records the relations the query referenced
+CREATE ROLE pgsm_relations_role;
+SELECT pg_stat_monitor_reset();
+SET ROLE pgsm_relations_role;
+SELECT * FROM foo1;
+RESET ROLE;
+SELECT decode_error_level(elevel), query, relations FROM pg_stat_monitor WHERE elevel > 0 ORDER BY query collate "C";
+DROP ROLE pgsm_relations_role;
+
+-- test that a subquery in FROM does not produce a malformed relation entry
+SELECT pg_stat_monitor_reset();
+SELECT * FROM (SELECT 1) sub;
+SELECT * FROM foo1, (SELECT 1) sub;
+SELECT query, relations FROM pg_stat_monitor WHERE query LIKE 'SELECT % sub%' ORDER BY query collate "C";
+
 DROP TABLE foo1;
 DROP TABLE foo2;
 DROP TABLE foo3;
