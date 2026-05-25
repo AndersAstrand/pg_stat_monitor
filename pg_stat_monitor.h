@@ -184,8 +184,8 @@ typedef struct Blocks
 										 * msec */
 
 	/*
-	 * Variables for local entry. The values to be passed to pgsm_update_entry
-	 * from pgsm_store.
+	 * Variables for local entry. The values to be passed to pgsm_update_entry()
+	 * from pgsm_store().
 	 */
 	instr_time	instr_shared_blk_read_time; /* time spent reading shared
 											 * blocks */
@@ -215,8 +215,8 @@ typedef struct JitInfo
 	double		jit_emission_time;	/* total time to emit jit code */
 
 	/*
-	 * Variables for local entry. The values to be passed to pgsm_update_entry
-	 * from pgsm_store.
+	 * Variables for local entry. The values to be passed to pgsm_update_entry()
+	 * from pgsm_store().
 	 */
 	instr_time	instr_generation_counter;	/* generation counter */
 	instr_time	instr_inlining_counter; /* inlining counter */
@@ -262,8 +262,6 @@ typedef struct Counters
 	int64		parallel_workers_launched;	/* # of parallel workers actually
 											 * launched */
 } Counters;
-
-/* Some global structure to get the cpu usage, really don't like the idea of global variable */
 
 /*
  * Statistics per statement

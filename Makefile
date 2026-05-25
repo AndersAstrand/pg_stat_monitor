@@ -38,6 +38,13 @@ REGRESS = basic \
 	parallel \
 	histogram
 
+REGRESS_PREP = install-test-extensions
+
 PG_CONFIG ?= pg_config
 PGXS := $(shell $(PG_CONFIG) --pgxs)
 include $(PGXS)
+
+# Build and install helper extensions used by the TAP suite. Driven
+# from REGRESS_PREP so `make installcheck` picks them up automatically.
+install-test-extensions:
+	$(MAKE) -C t/extensions/pgsm_bgw_test PG_CONFIG=$(PG_CONFIG) install
