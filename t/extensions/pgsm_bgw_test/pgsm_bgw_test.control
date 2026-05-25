@@ -1,0 +1,4 @@
+comment = 'bgworker SPI driver for pg_stat_monitor cleanup tests'
+default_version = '1.0'
+module_pathname = '$libdir/pgsm_bgw_test'
+relocatable = false

@@ -313,6 +313,7 @@ hash_entry_alloc(pgsmSharedState *pgsm, pgsmHashKey *key, int encoding)
 		SpinLockInit(&entry->mutex);
 		/* ... and don't forget the query text metadata */
 		entry->encoding = encoding;
+		entry->local_ctx = NULL;
 	}
 #if USE_DYNAMIC_HASH
 	if (entry)

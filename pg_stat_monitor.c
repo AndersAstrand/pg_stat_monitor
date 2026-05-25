@@ -84,9 +84,6 @@ PG_MODULE_MAGIC;
 
 #define PGSM_INVALID_IP_MASK	0xFFFFFFFF
 
-#define pgsm_client_ip_is_valid() \
-	(pgsm_client_ip != PGSM_INVALID_IP_MASK)
-
 /*---- Initialization Function Declarations ----*/
 void		_PG_init(void);
 
@@ -105,23 +102,29 @@ static double hist_bucket_timings[MAX_RESPONSE_BUCKET + 2][2];	/* Start and end 
 static int	hist_bucket_count_user;
 static int	hist_bucket_count_total;
 
-static uint32 pgsm_client_ip = PGSM_INVALID_IP_MASK;
-
-/* The array to store outer layer query id */
-static int64 *nested_queryids;
-static char **nested_query_txts;
-static List *lentries = NIL;
-
-static char relations[REL_LST][REL_LEN];
-
-static int	num_relations;		/* Number of relation in the query */
 static bool system_init = false;
-static struct rusage rusage_start;
-static struct rusage rusage_end;
 
-/* Application name and length; set each time when an entry is created locally */
-static char app_name[APPLICATIONNAME_LEN];
-static int	app_name_len;
+/*
+ * local_entries and active_queries are two per-backend stacks of
+ * queries in progress. local_entries holds pgsmEntries allocated
+ * for tracked queries, populated with stats by ExecutorEnd(). An
+ * entry may end up never populated because the query was parsed
+ * but not executed (such as the inner SELECT in CREATE VIEW) or
+ * errored before reaching the executor, in which case it is
+ * discarded at cleanup. active_queries is the executor stack
+ * itself. It holds every ExecutorRun() call regardless of whether
+ * the query is tracked, and pgsm_store() reads the last entry to
+ * resolve the parent queryid.
+ */
+static List *local_entries = NIL;
+
+typedef struct ActiveQuery
+{
+	int64		queryid;
+	char	   *query_text;		/* palloc'd in pgsm_mem_cxt */
+} ActiveQuery;
+
+static List *active_queries = NIL;
 
 
 /* Query buffer, store queries' text. */
@@ -197,22 +200,19 @@ DECLARE_HOOK(void pgsm_ProcessUtility, PlannedStmt *pstmt, const char *queryStri
 static int64 pgsm_hash_string(const char *str, int len);
 char	   *unpack_sql_state(int sql_state);
 
-static pgsmEntry *pgsm_create_hash_entry(uint64 bucket_id, int64 queryid, PlanInfo *plan_info);
-static void pgsm_add_to_list(pgsmEntry *entry, char *query_text, int query_len);
-static void pgsm_delete_entry(uint64 queryid);
-static pgsmEntry *pgsm_get_entry_for_query(int64 queryid, PlanInfo *plan_info, const char *query_text, int query_len, bool create, CmdType cmd_type);
+static pgsmEntry *pgsm_new_entry(int64 queryid, PlanInfo *plan_info);
+static void pgsm_push_local_entry(pgsmEntry *entry);
+static pgsmEntry *pgsm_get_or_create_local_entry(int64 queryid, PlanInfo *plan_info,
+												 const char *query_text, int query_len,
+												 CmdType cmd_type);
+static void pgsm_delete_local_entry(int64 queryid);
+static void pgsm_reset_local_state(void);
+static void pgsm_xact_callback(XactEvent event, void *arg);
+static void pgsm_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
+								  SubTransactionId parentSubid, void *arg);
 static int64 get_pgsm_query_id_hash(const char *norm_query, int len);
 
-static void pgsm_cleanup_callback(void *arg);
 static void pgsm_store_error(const char *query, ErrorData *edata);
-
-/*---- Local variables ----*/
-static MemoryContextCallback mem_cxt_reset_callback =
-{
-	.func = pgsm_cleanup_callback,
-	.arg = NULL
-};
-static volatile bool callback_setup = false;
 
 static void pgsm_update_entry(pgsmEntry *entry,
 							  const char *query,
@@ -229,6 +229,7 @@ static void pgsm_update_entry(pgsmEntry *entry,
 							  const struct JitInstrumentation *jitusage,
 							  int parallel_workers_to_launch,
 							  int parallel_workers_launched,
+							  pgsmLocalCtx *local_ctx,
 							  bool reset,
 							  pgsmStoreKind kind);
 static void pgsm_store(pgsmEntry *entry);
@@ -319,8 +320,13 @@ _PG_init(void)
 	prev_ExecutorCheckPerms_hook = ExecutorCheckPerms_hook;
 	ExecutorCheckPerms_hook = HOOK(pgsm_ExecutorCheckPerms);
 
-	nested_queryids = (int64 *) malloc(sizeof(int64) * max_stack_depth);
-	nested_query_txts = (char **) calloc(max_stack_depth, sizeof(char *));
+	/*
+	 * These callbacks are needed for cleanup when ExecutorEnd() is not
+	 * executed, for example after savepoint rollbacks or aborted
+	 * transactions.
+	 */
+	RegisterXactCallback(pgsm_xact_callback, NULL);
+	RegisterSubXactCallback(pgsm_subxact_callback, NULL);
 
 	system_init = true;
 }
@@ -389,19 +395,6 @@ pgsm_post_parse_analyze_internal(ParseState *pstate, Query *query, JumbleState *
 	if (!IsSystemInitialized())
 		return;
 
-	if (callback_setup == false)
-	{
-		/*
-		 * If MessageContext is valid setup a callback to cleanup our local
-		 * stats list when the MessagContext gets reset
-		 */
-		if (MemoryContextIsValid(MessageContext))
-		{
-			MemoryContextRegisterResetCallback(MessageContext, &mem_cxt_reset_callback);
-			callback_setup = true;
-		}
-	}
-
 	if (!pgsm_enabled(nesting_level))
 		return;
 
@@ -458,7 +451,7 @@ pgsm_post_parse_analyze_internal(ParseState *pstate, Query *query, JumbleState *
 	 * bucket value. The correct bucket value will be needed then to search
 	 * the hash table, or create the appropriate entry.
 	 */
-	entry = pgsm_create_hash_entry(0, query->queryId, NULL);
+	entry = pgsm_new_entry(query->queryId, NULL);
 
 	/*
 	 * Update other member that are not counters, so that we don't have to
@@ -468,24 +461,28 @@ pgsm_post_parse_analyze_internal(ParseState *pstate, Query *query, JumbleState *
 	entry->counters.info.cmd_type = query->commandType;
 
 	/*
-	 * Add the query text and entry to the local list.
-	 *
-	 * Preserve the normalized query if needed and we got a valid one.
-	 * Otherwise, store the actual query so that we don't have to check what
-	 * query to store when saving into the hash.
-	 *
-	 * In case of query_text, request the function to duplicate it so that it
-	 * is put in the relevant memory context.
+	 * Copy the query text to the entry and push it so other hooks
+	 * can find it by queryid.
 	 */
-	if (pgsm_normalized_query && norm_query)
-		pgsm_add_to_list(entry, norm_query, norm_query_len);
-	else
 	{
-		pgsm_add_to_list(entry, (char *) query_text, query_len);
-	}
+		const char *src;
+		int			slen;
 
-	/* Check that we've not exceeded max_stack_depth */
-	Assert(list_length(lentries) <= max_stack_depth);
+		if (pgsm_normalized_query && norm_query)
+		{
+			src = norm_query;
+			slen = norm_query_len;
+		}
+		else
+		{
+			src = query_text;
+			slen = query_len;
+		}
+		entry->query_text.query_pointer = MemoryContextAlloc(GetPgsmMemoryContext(),
+															 slen + 1);
+		strlcpy(entry->query_text.query_pointer, src, slen + 1);
+	}
+	pgsm_push_local_entry(entry);
 
 	if (norm_query)
 		pfree(norm_query);
@@ -509,27 +506,40 @@ pgsm_post_parse_analyze(ParseState *pstate, Query *query, JumbleState *jstate)
 static void
 pgsm_ExecutorStart(QueryDesc *queryDesc, int eflags)
 {
-	if (getrusage(RUSAGE_SELF, &rusage_start) != 0)
-		elog(DEBUG1, "[pg_stat_monitor] pgsm_ExecutorStart: failed to execute getrusage.");
+	bool		tracking = pgsm_enabled(nesting_level) &&
+		queryDesc->plannedstmt->queryId != INT64CONST(0);
+	pgsmEntry  *entry = NULL;
+
+	if (tracking)
+	{
+		/*
+		 * The entry may not exist for EXECUTEs with a cached plan that
+		 * bypass post_parse_analyze(). Create it before prev_ExecutorStart
+		 * because standard_ExecutorStart() runs ExecutorCheckPerms_hook,
+		 * which populates entry->local_ctx->relations on the top-of-stack
+		 * local entry.
+		 */
+		entry = pgsm_get_or_create_local_entry(queryDesc->plannedstmt->queryId, NULL,
+											   queryDesc->sourceText,
+											   strlen(queryDesc->sourceText),
+											   queryDesc->operation);
+
+		if (entry && entry->local_ctx)
+		{
+			if (getrusage(RUSAGE_SELF, &entry->local_ctx->rusage_start) == 0)
+				entry->local_ctx->have_rusage = true;
+			else
+				elog(DEBUG1, "[pg_stat_monitor] pgsm_ExecutorStart: failed to execute getrusage.");
+		}
+	}
 
 	if (prev_ExecutorStart)
 		prev_ExecutorStart(queryDesc, eflags);
 	else
 		standard_ExecutorStart(queryDesc, eflags);
 
-	/*
-	 * If query has queryId zero, don't track it.  This prevents double
-	 * counting of optimizable statements that are directly contained in
-	 * utility statements.
-	 */
-	if (pgsm_enabled(nesting_level) &&
-		queryDesc->plannedstmt->queryId != INT64CONST(0))
+	if (tracking)
 	{
-		/*
-		 * Set up to track total elapsed time in ExecutorRun.  Make sure the
-		 * space is allocated in the per-query context so it will go away at
-		 * ExecutorEnd.
-		 */
 		if (queryDesc->totaltime == NULL)
 		{
 			MemoryContext oldcxt;
@@ -543,7 +553,7 @@ pgsm_ExecutorStart(QueryDesc *queryDesc, int eflags)
 
 
 /*
- * ExecutorRun hook: all we need do is track nesting depth
+ * ExecutorRun hook: track nesting depth and the active query stack.
  */
 static void
 #if PG_VERSION_NUM < 180000
@@ -553,11 +563,17 @@ pgsm_ExecutorRun(QueryDesc *queryDesc, ScanDirection direction, uint64 count,
 pgsm_ExecutorRun(QueryDesc *queryDesc, ScanDirection direction, uint64 count)
 #endif
 {
-	if (nesting_level >= 0 && nesting_level < max_stack_depth)
-	{
-		nested_queryids[nesting_level] = queryDesc->plannedstmt->queryId;
-		nested_query_txts[nesting_level] = strdup(queryDesc->sourceText);
-	}
+	MemoryContext oldctx;
+	ActiveQuery *me;
+
+	me = MemoryContextAlloc(GetPgsmMemoryContext(), sizeof(ActiveQuery));
+	me->queryid = queryDesc->plannedstmt->queryId;
+	me->query_text = MemoryContextStrdup(GetPgsmMemoryContext(),
+										 queryDesc->sourceText);
+
+	oldctx = MemoryContextSwitchTo(GetPgsmMemoryContext());
+	active_queries = lappend(active_queries, me);
+	MemoryContextSwitchTo(oldctx);
 
 	nesting_level++;
 	PG_TRY();
@@ -578,26 +594,13 @@ pgsm_ExecutorRun(QueryDesc *queryDesc, ScanDirection direction, uint64 count)
 			standard_ExecutorRun(queryDesc, direction, count);
 #endif
 		}
-		nesting_level--;
-		if (nesting_level >= 0 && nesting_level < max_stack_depth)
-		{
-			nested_queryids[nesting_level] = INT64CONST(0);
-			if (nested_query_txts[nesting_level])
-				free(nested_query_txts[nesting_level]);
-			nested_query_txts[nesting_level] = NULL;
-		}
 	}
-	PG_CATCH();
+	PG_FINALLY();
 	{
 		nesting_level--;
-		if (nesting_level >= 0 && nesting_level < max_stack_depth)
-		{
-			nested_queryids[nesting_level] = INT64CONST(0);
-			if (nested_query_txts[nesting_level])
-				free(nested_query_txts[nesting_level]);
-			nested_query_txts[nesting_level] = NULL;
-		}
-		PG_RE_THROW();
+		pfree(me->query_text);
+		pfree(me);
+		active_queries = list_delete_last(active_queries);
 	}
 	PG_END_TRY();
 }
@@ -690,11 +693,14 @@ pgsm_ExecutorEnd(QueryDesc *queryDesc)
 
 	if (queryId != INT64CONST(0) && queryDesc->totaltime && pgsm_enabled(nesting_level))
 	{
-		entry = pgsm_get_entry_for_query(queryId, plan_ptr, (char *) queryDesc->sourceText, strlen(queryDesc->sourceText), true, queryDesc->operation);
+		entry = pgsm_get_or_create_local_entry(queryId, plan_ptr,
+											   (char *) queryDesc->sourceText,
+											   strlen(queryDesc->sourceText),
+											   queryDesc->operation);
 		if (!entry)
 		{
 			elog(DEBUG2, "[pg_stat_monitor] pgsm_ExecutorEnd: Failed to find entry for [" INT64_FORMAT "] %s.", queryId, queryDesc->sourceText);
-			return;
+			goto end;
 		}
 
 		if (entry->key.planid == 0)
@@ -709,12 +715,19 @@ pgsm_ExecutorEnd(QueryDesc *queryDesc)
 		sys_info.utime = 0;
 		sys_info.stime = 0;
 
-		if (getrusage(RUSAGE_SELF, &rusage_end) != 0)
-			elog(DEBUG1, "[pg_stat_monitor] pgsm_ExecutorEnd: Failed to execute getrusage.");
-		else
+		if (entry->local_ctx && entry->local_ctx->have_rusage)
 		{
-			sys_info.utime = time_diff(rusage_end.ru_utime, rusage_start.ru_utime);
-			sys_info.stime = time_diff(rusage_end.ru_stime, rusage_start.ru_stime);
+			struct rusage rusage_end;
+
+			if (getrusage(RUSAGE_SELF, &rusage_end) == 0)
+			{
+				sys_info.utime = time_diff(rusage_end.ru_utime,
+										   entry->local_ctx->rusage_start.ru_utime);
+				sys_info.stime = time_diff(rusage_end.ru_stime,
+										   entry->local_ctx->rusage_start.ru_stime);
+			}
+			else
+				elog(DEBUG1, "[pg_stat_monitor] pgsm_ExecutorEnd: Failed to execute getrusage.");
 		}
 
 		entry->counters.info.cmd_type = queryDesc->operation;
@@ -743,20 +756,23 @@ pgsm_ExecutorEnd(QueryDesc *queryDesc)
 						  0,	/* parallel_workers_to_launch */
 						  0,	/* parallel_workers_launched */
 #endif
+						  entry->local_ctx, /* local_ctx */
 						  false,	/* reset */
 						  PGSM_EXEC);	/* kind */
 
 		pgsm_store(entry);
 	}
 
+end:
 	if (prev_ExecutorEnd)
 		prev_ExecutorEnd(queryDesc);
 	else
 		standard_ExecutorEnd(queryDesc);
 
-	pgsm_delete_entry(queryDesc->plannedstmt->queryId);
+	pgsm_delete_local_entry(queryDesc->plannedstmt->queryId);
 
-	num_relations = 0;
+	if (nesting_level == 0)
+		pgsm_reset_local_state();
 }
 
 static bool
@@ -770,8 +786,18 @@ pgsm_ExecutorCheckPerms(List *rt, List *rp, bool abort)
 	int			i = 0;
 	int			j = 0;
 	Oid			list_oid[20];
+	pgsmEntry  *entry = (local_entries != NIL) ? llast(local_entries) : NULL;
 
-	num_relations = 0;
+	if (entry == NULL || entry->local_ctx == NULL)
+	{
+		if (prev_ExecutorCheckPerms_hook)
+#if PG_VERSION_NUM < 160000
+			return prev_ExecutorCheckPerms_hook(rt, abort);
+#else
+			return prev_ExecutorCheckPerms_hook(rt, rp, abort);
+#endif
+		return true;
+	}
 
 	foreach(lr, rt)
 	{
@@ -803,13 +829,15 @@ pgsm_ExecutorCheckPerms(List *rt, List *rp, bool abort)
 				namespace_name = get_namespace_name(get_rel_namespace(rte->relid));
 				relation_name = get_rel_name(rte->relid);
 				if (rte->relkind == 'v')
-					snprintf(relations[i++], REL_LEN, "%s.%s*", namespace_name, relation_name);
+					snprintf(entry->local_ctx->relations[i++], REL_LEN, "%s.%s*",
+							 namespace_name, relation_name);
 				else
-					snprintf(relations[i++], REL_LEN, "%s.%s", namespace_name, relation_name);
+					snprintf(entry->local_ctx->relations[i++], REL_LEN, "%s.%s",
+							 namespace_name, relation_name);
 			}
 		}
 	}
-	num_relations = i;
+	entry->local_ctx->num_relations = i;
 
 	if (prev_ExecutorCheckPerms_hook)
 #if PG_VERSION_NUM < 160000
@@ -829,7 +857,7 @@ pgsm_planner_hook(Query *parse, const char *query_string, int cursorOptions, Par
 
 	/*
 	 * We can't process the query if no query_string is provided, as
-	 * pgsm_store needs it.  We also ignore query without queryid, as it would
+	 * pgsm_store() needs it.  We also ignore query without queryid, as it would
 	 * be treated as a utility statement, which may not be the case.
 	 *
 	 * Note that planner_hook can be called from the planner itself, so we
@@ -867,8 +895,9 @@ pgsm_planner_hook(Query *parse, const char *query_string, int cursorOptions, Par
 		walusage_start = pgWalUsage;
 		INSTR_TIME_SET_CURRENT(start);
 
-		if (MemoryContextIsValid(MessageContext))
-			entry = pgsm_get_entry_for_query(queryId, NULL, query_string, strlen(query_string), true, parse->commandType);
+		entry = pgsm_get_or_create_local_entry(queryId, NULL, query_string,
+											   strlen(query_string),
+											   parse->commandType);
 
 #if PG_VERSION_NUM >= 170000
 		nesting_level++;
@@ -927,6 +956,7 @@ pgsm_planner_hook(Query *parse, const char *query_string, int cursorOptions, Par
 							  NULL, /* jitusage */
 							  0,	/* parallel_workers_to_launch */
 							  0,	/* parallel_workers_launched */
+							  entry->local_ctx, /* local_ctx */
 							  false,	/* reset */
 							  PGSM_PLAN);	/* kind */
 	}
@@ -1029,9 +1059,13 @@ pgsm_ProcessUtility(PlannedStmt *pstmt, const char *queryString,
 		BufferUsage bufusage_start = pgBufferUsage;
 		WalUsage	walusage;
 		WalUsage	walusage_start = pgWalUsage;
-		pgsmEntry  *entry = pgsm_create_hash_entry(0, queryId, NULL);
+		pgsmEntry  *entry = pgsm_new_entry(queryId, NULL);
 
-		if (getrusage(RUSAGE_SELF, &rusage_start) != 0)
+		if (entry->local_ctx && getrusage(RUSAGE_SELF, &entry->local_ctx->rusage_start) == 0)
+			entry->local_ctx->have_rusage = true;
+		else if (entry->local_ctx == NULL)
+			elog(DEBUG1, "[pg_stat_monitor] pgsm_ProcessUtility: no local ctx on entry.");
+		else
 			elog(DEBUG1, "[pg_stat_monitor] pgsm_ProcessUtility: Failed to execute getrusage.");
 
 		INSTR_TIME_SET_CURRENT(start);
@@ -1064,12 +1098,19 @@ pgsm_ProcessUtility(PlannedStmt *pstmt, const char *queryString,
 
 		PG_END_TRY();
 
-		if (getrusage(RUSAGE_SELF, &rusage_end) != 0)
-			elog(DEBUG1, "[pg_stat_monitor] pgsm_ProcessUtility: Failed to execute getrusage.");
-		else
+		if (entry->local_ctx && entry->local_ctx->have_rusage)
 		{
-			sys_info.utime = time_diff(rusage_end.ru_utime, rusage_start.ru_utime);
-			sys_info.stime = time_diff(rusage_end.ru_stime, rusage_start.ru_stime);
+			struct rusage rusage_end;
+
+			if (getrusage(RUSAGE_SELF, &rusage_end) == 0)
+			{
+				sys_info.utime = time_diff(rusage_end.ru_utime,
+										   entry->local_ctx->rusage_start.ru_utime);
+				sys_info.stime = time_diff(rusage_end.ru_stime,
+										   entry->local_ctx->rusage_start.ru_stime);
+			}
+			else
+				elog(DEBUG1, "[pg_stat_monitor] pgsm_ProcessUtility: Failed to execute getrusage.");
 		}
 
 		INSTR_TIME_SET_CURRENT(duration);
@@ -1097,10 +1138,10 @@ pgsm_ProcessUtility(PlannedStmt *pstmt, const char *queryString,
 		entry->pgsm_query_id = get_pgsm_query_id_hash(query_text, query_len);
 		entry->counters.info.cmd_type = pstmt->commandType;
 
-		pgsm_add_to_list(entry, query_text, query_len);
-
-		/* Check that we've not exceeded max_stack_depth */
-		Assert(list_length(lentries) <= max_stack_depth);
+		entry->query_text.query_pointer = MemoryContextAlloc(GetPgsmMemoryContext(),
+															 query_len + 1);
+		strlcpy(entry->query_text.query_pointer, query_text, query_len + 1);
+		pgsm_push_local_entry(entry);
 
 		/* The plan details are captured when the query finishes */
 		pgsm_update_entry(entry,	/* entry */
@@ -1118,6 +1159,7 @@ pgsm_ProcessUtility(PlannedStmt *pstmt, const char *queryString,
 						  NULL, /* jitusage */
 						  0,	/* parallel_workers_to_launch */
 						  0,	/* parallel_workers_launched */
+						  entry->local_ctx, /* local_ctx */
 						  false,	/* reset */
 						  PGSM_EXEC);	/* kind */
 
@@ -1178,7 +1220,10 @@ pgsm_ProcessUtility(PlannedStmt *pstmt, const char *queryString,
 		PG_END_TRY();
 #endif
 	}
-	pgsm_delete_entry(pstmt->queryId);
+	pgsm_delete_local_entry(pstmt->queryId);
+
+	if (nesting_level == 0)
+		pgsm_reset_local_state();
 }
 
 /*
@@ -1293,6 +1338,7 @@ pgsm_update_entry(pgsmEntry *entry,
 				  const struct JitInstrumentation *jitusage,
 				  int parallel_workers_to_launch,
 				  int parallel_workers_launched,
+				  pgsmLocalCtx *local_ctx,
 				  bool reset,
 				  pgsmStoreKind kind)
 {
@@ -1396,19 +1442,27 @@ pgsm_update_entry(pgsmEntry *entry,
 	/* Only should process this once when storing the data */
 	if (kind == PGSM_STORE)
 	{
-		if (pgsm_track_application_names && app_name_len > 0 && !entry->counters.info.application_name[0])
-			strlcpy(entry->counters.info.application_name, app_name, APPLICATIONNAME_LEN);
+		if (pgsm_track_application_names && local_ctx &&
+			local_ctx->app_name_len > 0 && !entry->counters.info.application_name[0])
+			strlcpy(entry->counters.info.application_name, local_ctx->app_name,
+					APPLICATIONNAME_LEN);
 
-		entry->counters.info.num_relations = num_relations;
-		for (int i = 0; i < num_relations; i++)
-			strlcpy(entry->counters.info.relations[i], relations[i], REL_LEN);
+		if (local_ctx)
+		{
+			entry->counters.info.num_relations = local_ctx->num_relations;
+			for (int i = 0; i < local_ctx->num_relations; i++)
+				strlcpy(entry->counters.info.relations[i], local_ctx->relations[i],
+						REL_LEN);
+		}
 
-		if (nesting_level > 0 && nesting_level < max_stack_depth && entry->key.parentid != 0 && pgsm_track == PGSM_TRACK_ALL)
+		if (active_queries != NIL && entry->key.parentid != 0 &&
+			pgsm_track == PGSM_TRACK_ALL)
 		{
 			if (!DsaPointerIsValid(entry->counters.info.parent_query))
 			{
-				int			parent_query_len = nested_query_txts[nesting_level - 1] ?
-					strlen(nested_query_txts[nesting_level - 1]) : 0;
+				ActiveQuery *parent = llast(active_queries);
+				int			parent_query_len = parent->query_text ?
+					strlen(parent->query_text) : 0;
 
 				/* If we have a parent query, store it in the raw dsa area */
 				if (parent_query_len > 0)
@@ -1426,7 +1480,7 @@ pgsm_update_entry(pgsmEntry *entry,
 					if (DsaPointerIsValid(qry))
 					{
 						qry_buff = dsa_get_address(query_dsa_area, qry);
-						memcpy(qry_buff, nested_query_txts[nesting_level - 1], parent_query_len);
+						memcpy(qry_buff, parent->query_text, parent_query_len);
 						qry_buff[parent_query_len] = 0;
 						/* store the dsa pointer for parent query text */
 						entry->counters.info.parent_query = qry;
@@ -1569,7 +1623,7 @@ pgsm_store_error(const char *query, ErrorData *edata)
 
 	queryid = pgsm_hash_string(query, len);
 
-	entry = pgsm_create_hash_entry(0, queryid, NULL);
+	entry = pgsm_new_entry(queryid, NULL);
 	entry->query_text.query_pointer = pnstrdup(query, len);
 
 	entry->pgsm_query_id = get_pgsm_query_id_hash(query, len);
@@ -1582,123 +1636,130 @@ pgsm_store_error(const char *query, ErrorData *edata)
 }
 
 static void
-pgsm_add_to_list(pgsmEntry *entry, char *query_text, int query_len)
+pgsm_push_local_entry(pgsmEntry *entry)
 {
-	/* Switch to pgsm memory context */
 	MemoryContext oldctx = MemoryContextSwitchTo(GetPgsmMemoryContext());
 
-	entry->query_text.query_pointer = pnstrdup(query_text, query_len);
-	lentries = lappend(lentries, entry);
+	local_entries = lappend(local_entries, entry);
 	MemoryContextSwitchTo(oldctx);
 }
 
-static void
-pgsm_delete_entry(uint64 queryid)
+/*
+ * Used by hooks that may run with or without an existing entry
+ * because post_parse_analyze() does not always run (for example,
+ * for a cached query plan that is reused without re-parsing).
+ */
+static pgsmEntry *
+pgsm_get_or_create_local_entry(int64 queryid, PlanInfo *plan_info,
+							   const char *query_text, int query_len, CmdType cmd_type)
 {
-	pgsmEntry  *entry = NULL;
-	ListCell   *lc = NULL;
+	pgsmEntry  *entry;
 
-	if (lentries == NIL)
-		return;
-
-	entry = (pgsmEntry *) llast(lentries);
-	if (entry->key.queryid == queryid)
+	/* Search list in reverse, since the entry we want is almost always at the end. */
+	for (int i = list_length(local_entries) - 1; i >= 0; i--)
 	{
-		pfree(entry->query_text.query_pointer);
-		entry->query_text.query_pointer = NULL;
-		lentries = list_delete_last(lentries);
-		return;
+		entry = list_nth(local_entries, i);
+		if (entry->key.queryid == queryid)
+			return entry;
 	}
 
-	/*
-	 * The rest of the code is just paranoia. In theory this list is a stack,
-	 * and we always want to remove the last item. Similarly, in the getter
-	 * method we are always looking for the last item.
-	 */
+	if (!query_text)
+		return NULL;
 
-	foreach(lc, lentries)
+	entry = pgsm_new_entry(queryid, plan_info);
+	entry->pgsm_query_id = get_pgsm_query_id_hash(query_text, query_len);
+	entry->counters.info.cmd_type = cmd_type;
+	entry->query_text.query_pointer = MemoryContextAlloc(GetPgsmMemoryContext(),
+														 query_len + 1);
+	strlcpy(entry->query_text.query_pointer, query_text, query_len + 1);
+	pgsm_push_local_entry(entry);
+	return entry;
+}
+
+/*
+ * The entry's storage is not freed here. pgsm_reset_local_state()
+ * will free it later.
+ */
+static void
+pgsm_delete_local_entry(int64 queryid)
+{
+	/* Search list in reverse, since the entry we want is almost always at the end. */
+	for (int i = list_length(local_entries) - 1; i >= 0; i--)
 	{
-		entry = lfirst(lc);
+		pgsmEntry  *entry = list_nth(local_entries, i);
+
 		if (entry->key.queryid == queryid)
 		{
-			pfree(entry->query_text.query_pointer);
-			entry->query_text.query_pointer = NULL;
-			lentries = list_delete_cell(lentries, lc);
+			if (entry->query_text.query_pointer)
+			{
+				pfree(entry->query_text.query_pointer);
+				entry->query_text.query_pointer = NULL;
+			}
+			local_entries = list_delete_nth_cell(local_entries, i);
 			return;
 		}
 	}
 }
 
-static pgsmEntry *
-pgsm_get_entry_for_query(int64 queryid, PlanInfo *plan_info, const char *query_text, int query_len, bool create, CmdType cmd_type)
+static void
+pgsm_reset_local_state(void)
 {
-	pgsmEntry  *entry = NULL;
-	ListCell   *lc = NULL;
-
-	/* First bet is on the last entry */
-	if (lentries == NIL && !create)
-		return NULL;
-
-	if (lentries)
-	{
-		entry = (pgsmEntry *) llast(lentries);
-		if (entry->key.queryid == queryid)
-			return entry;
-
-		foreach(lc, lentries)
-		{
-			entry = lfirst(lc);
-			if (entry->key.queryid == queryid)
-				return entry;
-		}
-	}
-	if (create && query_text)
-	{
-		/*
-		 * At this point, we don't know which bucket this query will land in,
-		 * so passing 0. The store function MUST later update it based on the
-		 * current bucket value. The correct bucket value will be needed then
-		 * to search the hash table, or create the appropriate entry.
-		 */
-		entry = pgsm_create_hash_entry(0, queryid, plan_info);
-
-		/*
-		 * Update other member that are not counters, so that we don't have to
-		 * worry about these.
-		 */
-		entry->pgsm_query_id = get_pgsm_query_id_hash(query_text, query_len);
-		entry->counters.info.cmd_type = cmd_type;
-		pgsm_add_to_list(entry, (char *) query_text, query_len);
-	}
-
-	return entry;
+	local_entries = NIL;
+	active_queries = NIL;
+	MemoryContextReset(GetPgsmMemoryContext());
 }
 
 static void
-pgsm_cleanup_callback(void *arg)
+pgsm_xact_callback(XactEvent event, void *arg)
 {
-	/* Reset the memory context holding the list */
-	MemoryContextReset(GetPgsmMemoryContext());
-
-	lentries = NIL;
-	callback_setup = false;
+	switch (event)
+	{
+		case XACT_EVENT_ABORT:
+		case XACT_EVENT_PARALLEL_ABORT:
+			/* On abort the executor is being torn down anyway, so reset unconditionally. */
+			pgsm_reset_local_state();
+			break;
+		case XACT_EVENT_COMMIT:
+		case XACT_EVENT_PARALLEL_COMMIT:
+			/*
+			 * VACUUM and similar utility commands commit incrementally
+			 * during execution. Each internal commit runs this callback
+			 * during an outer hook's execution, so we only reset when
+			 * our state is unwound.
+			 */
+			if (local_entries == NIL && nesting_level == 0)
+				pgsm_reset_local_state();
+			break;
+		default:
+			break;
+	}
 }
 
-/*
- * Function encapsulating some external calls for filling up the hash key data structure.
- * The bucket_id may not be known at this stage. So pass any value that you may wish.
- */
+static void
+pgsm_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
+					  SubTransactionId parentSubid, void *arg)
+{
+	/*
+	 * If a subxact aborts while we are inside one of our hooks, the
+	 * eventual top-level abort handles cleanup. We only reset here
+	 * when already unwound.
+	 */
+	if (event == SUBXACT_EVENT_ABORT_SUB &&
+		local_entries == NIL && nesting_level == 0)
+		pgsm_reset_local_state();
+}
+
 static pgsmEntry *
-pgsm_create_hash_entry(uint64 bucket_id, int64 queryid, PlanInfo *plan_info)
+pgsm_new_entry(int64 queryid, PlanInfo *plan_info)
 {
 	pgsmEntry  *entry;
 	int			sec_ctx;
 	bool		found_client_addr = false;
-	MemoryContext oldctx;
+	MemoryContext pgsm_cxt = GetPgsmMemoryContext();
 
-	/* Create an entry in the pgsm memory context */
-	oldctx = MemoryContextSwitchTo(GetPgsmMemoryContext());
-	entry = palloc0(sizeof(pgsmEntry));
+	entry = MemoryContextAllocZero(pgsm_cxt, sizeof(pgsmEntry));
+	entry->local_ctx = MemoryContextAllocZero(pgsm_cxt, sizeof(pgsmLocalCtx));
+	entry->local_ctx->client_ip = PGSM_INVALID_IP_MASK;
 
 	/*
 	 * Get the user ID. Let's use this instead of GetUserID as this won't
@@ -1709,15 +1770,16 @@ pgsm_create_hash_entry(uint64 bucket_id, int64 queryid, PlanInfo *plan_info)
 	if (pgsm_track_application_names)
 	{
 		/* Get the application name and set appid */
-		app_name_len = pg_get_application_name(app_name, APPLICATIONNAME_LEN);
-		entry->key.appid = pgsm_hash_string((const char *) app_name, app_name_len);
+		entry->local_ctx->app_name_len = pg_get_application_name(entry->local_ctx->app_name,
+															 APPLICATIONNAME_LEN);
+		entry->key.appid = pgsm_hash_string((const char *) entry->local_ctx->app_name,
+											entry->local_ctx->app_name_len);
 	}
 
 	/* client address */
-	if (!pgsm_client_ip_is_valid())
-		pgsm_client_ip = pg_get_client_addr(&found_client_addr);
-
-	entry->key.ip = pgsm_client_ip;
+	entry->local_ctx->client_ip = pg_get_client_addr(&found_client_addr);
+	entry->local_ctx->have_client_ip = found_client_addr;
+	entry->key.ip = entry->local_ctx->client_ip;
 
 	/* PlanID, if there is one */
 	entry->key.planid = plan_info ? plan_info->planid : 0;
@@ -1725,7 +1787,6 @@ pgsm_create_hash_entry(uint64 bucket_id, int64 queryid, PlanInfo *plan_info)
 	/* Set remaining data */
 	entry->key.dbid = MyDatabaseId;
 	entry->key.queryid = queryid;
-	entry->key.bucket_id = bucket_id;
 	entry->key.parentid = 0;
 
 #if PG_VERSION_NUM >= 170000
@@ -1733,8 +1794,6 @@ pgsm_create_hash_entry(uint64 bucket_id, int64 queryid, PlanInfo *plan_info)
 #else
 	entry->key.toplevel = ((nesting_level + plan_nested_level) == 0);
 #endif
-
-	MemoryContextSwitchTo(oldctx);
 
 	return entry;
 }
@@ -1849,14 +1908,10 @@ pgsm_store(pgsmEntry *entry)
 
 
 	/* Update parent id if needed */
-	if (pgsm_track == PGSM_TRACK_ALL && nesting_level > 0 && nesting_level < max_stack_depth)
-	{
-		entry->key.parentid = nested_queryids[nesting_level - 1];
-	}
+	if (pgsm_track == PGSM_TRACK_ALL && active_queries != NIL)
+		entry->key.parentid = ((ActiveQuery *) llast(active_queries))->queryid;
 	else
-	{
 		entry->key.parentid = INT64CONST(0);
-	}
 
 #if PG_VERSION_NUM >= 170000
 	memcpy(&jitusage.deform_counter, &entry->counters.jitinfo.instr_deform_counter, sizeof(instr_time));
@@ -1973,6 +2028,7 @@ pgsm_store(pgsmEntry *entry)
 					  &jitusage,	/* jitusage */
 					  entry->counters.parallel_workers_to_launch,	/* parallel_workers_to_launch */
 					  entry->counters.parallel_workers_launched,	/* parallel_workers_launched */
+					  entry->local_ctx, /* local_ctx */
 					  reset,	/* reset */
 					  PGSM_STORE);
 

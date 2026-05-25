@@ -16,7 +16,10 @@
 
 #include <postgres.h>
 
+#include <sys/resource.h>
+
 #include <executor/instrument.h>
+#include <jit/jit.h>
 #include <lib/dshash.h>
 #include <nodes/nodes.h>
 #include <storage/lwlock.h>
@@ -184,8 +187,8 @@ typedef struct Blocks
 										 * msec */
 
 	/*
-	 * Variables for local entry. The values to be passed to pgsm_update_entry
-	 * from pgsm_store.
+	 * Variables for local entry. The values to be passed to pgsm_update_entry()
+	 * from pgsm_store().
 	 */
 	instr_time	instr_shared_blk_read_time; /* time spent reading shared
 											 * blocks */
@@ -215,8 +218,8 @@ typedef struct JitInfo
 	double		jit_emission_time;	/* total time to emit jit code */
 
 	/*
-	 * Variables for local entry. The values to be passed to pgsm_update_entry
-	 * from pgsm_store.
+	 * Variables for local entry. The values to be passed to pgsm_update_entry()
+	 * from pgsm_store().
 	 */
 	instr_time	instr_generation_counter;	/* generation counter */
 	instr_time	instr_inlining_counter; /* inlining counter */
@@ -263,7 +266,25 @@ typedef struct Counters
 											 * launched */
 } Counters;
 
-/* Some global structure to get the cpu usage, really don't like the idea of global variable */
+/*
+ * State for each tracked query, pointed to by pgsmEntry->local_ctx.
+ * Fields are populated by various hooks during a statement, then
+ * pgsm_store() adds them to the matching shared entry. Local entries
+ * live in pgsm_mem_cxt, while shared entries have local_ctx NULL.
+ */
+typedef struct pgsmLocalCtx
+{
+	struct rusage rusage_start;
+	bool		have_rusage;
+
+	int			num_relations;
+	char		relations[REL_LST][REL_LEN];
+
+	char		app_name[APPLICATIONNAME_LEN];
+	int			app_name_len;
+	uint32		client_ip;
+	bool		have_client_ip;
+} pgsmLocalCtx;
 
 /*
  * Statistics per statement
@@ -284,6 +305,7 @@ typedef struct pgsmEntry
 		dsa_pointer query_pos;	/* query location within query buffer */
 		char	   *query_pointer;
 	}			query_text;
+	pgsmLocalCtx *local_ctx;	/* Always NULL for shared entries. */
 } pgsmEntry;
 
 /*
