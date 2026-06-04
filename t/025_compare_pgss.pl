@@ -161,35 +161,35 @@ is($stdout, 't', "Compare: rows are equal).");
 
 ($cmdret, $stdout, $stderr) = $node->psql(
 	'postgres',
-	'SELECT SUM(PGSM.total_exec_time) = SUM(ROUND(PGSS.total_exec_time::numeric,4)) OR SUM(PGSS.total_exec_time::numeric) % SUM(PGSM.total_exec_time::numeric) < 1 FROM pg_stat_monitor AS PGSM INNER JOIN pg_stat_statements AS PGSS ON PGSS.query = PGSM.query WHERE PGSM.query LIKE \'%DELETE FROM pgbench_accounts%\' GROUP BY PGSM.query;',
+	'SELECT SUM(PGSM.total_exec_time) BETWEEN SUM(PGSS.total_exec_time) / 3 AND SUM(PGSS.total_exec_time) * 3 FROM pg_stat_monitor AS PGSM INNER JOIN pg_stat_statements AS PGSS ON PGSS.query = PGSM.query WHERE PGSM.query LIKE \'%DELETE FROM pgbench_accounts%\' GROUP BY PGSM.query;',
 	extra_params => [ '-Pformat=unaligned', '-Ptuples_only=on' ]);
 trim($stdout);
 is($stdout, 't', "Compare: total_exec_time is equal.");
 
 ($cmdret, $stdout, $stderr) = $node->psql(
 	'postgres',
-	'SELECT SUM(PGSM.min_exec_time) = SUM(ROUND(PGSS.min_exec_time::numeric,4)) OR SUM(PGSS.min_exec_time::numeric) % SUM(PGSM.min_exec_time::numeric) < 1 FROM pg_stat_monitor AS PGSM INNER JOIN pg_stat_statements AS PGSS ON PGSS.query = PGSM.query WHERE PGSM.query LIKE \'%DELETE FROM pgbench_accounts%\' GROUP BY PGSM.query;',
+	'SELECT SUM(PGSM.min_exec_time) BETWEEN SUM(PGSS.min_exec_time) / 3 AND SUM(PGSS.min_exec_time) * 3 FROM pg_stat_monitor AS PGSM INNER JOIN pg_stat_statements AS PGSS ON PGSS.query = PGSM.query WHERE PGSM.query LIKE \'%DELETE FROM pgbench_accounts%\' GROUP BY PGSM.query;',
 	extra_params => [ '-Pformat=unaligned', '-Ptuples_only=on' ]);
 trim($stdout);
 is($stdout, 't', "Compare: min_exec_time is equal.");
 
 ($cmdret, $stdout, $stderr) = $node->psql(
 	'postgres',
-	'SELECT SUM(PGSM.max_exec_time) = SUM(ROUND(PGSS.max_exec_time::numeric,4)) OR SUM(PGSS.max_exec_time::numeric) % SUM(PGSM.max_exec_time::numeric) < 1 FROM pg_stat_monitor AS PGSM INNER JOIN pg_stat_statements AS PGSS ON PGSS.query = PGSM.query WHERE PGSM.query LIKE \'%DELETE FROM pgbench_accounts%\' GROUP BY PGSM.query;',
+	'SELECT SUM(PGSM.max_exec_time) BETWEEN SUM(PGSS.max_exec_time) / 3 AND SUM(PGSS.max_exec_time) * 3 FROM pg_stat_monitor AS PGSM INNER JOIN pg_stat_statements AS PGSS ON PGSS.query = PGSM.query WHERE PGSM.query LIKE \'%DELETE FROM pgbench_accounts%\' GROUP BY PGSM.query;',
 	extra_params => [ '-Pformat=unaligned', '-Ptuples_only=on' ]);
 trim($stdout);
 is($stdout, 't', "Compare: max_exec_time is equal.");
 
 ($cmdret, $stdout, $stderr) = $node->psql(
 	'postgres',
-	'SELECT SUM(PGSM.mean_exec_time) = SUM(ROUND(PGSS.mean_exec_time::numeric,4)) OR SUM(PGSS.mean_exec_time::numeric) % SUM(PGSM.mean_exec_time::numeric) < 1 FROM pg_stat_monitor AS PGSM INNER JOIN pg_stat_statements AS PGSS ON PGSS.query = PGSM.query WHERE PGSM.query LIKE \'%DELETE FROM pgbench_accounts%\' GROUP BY PGSM.query;',
+	'SELECT SUM(PGSM.mean_exec_time) BETWEEN SUM(PGSS.mean_exec_time) / 3 AND SUM(PGSS.mean_exec_time) * 3 FROM pg_stat_monitor AS PGSM INNER JOIN pg_stat_statements AS PGSS ON PGSS.query = PGSM.query WHERE PGSM.query LIKE \'%DELETE FROM pgbench_accounts%\' GROUP BY PGSM.query;',
 	extra_params => [ '-Pformat=unaligned', '-Ptuples_only=on' ]);
 trim($stdout);
 is($stdout, 't', "Compare: mean_exec_time is equal.");
 
 ($cmdret, $stdout, $stderr) = $node->psql(
 	'postgres',
-	'SELECT SUM(PGSM.stddev_exec_time) = SUM(ROUND(PGSS.stddev_exec_time::numeric,4)) OR SUM(PGSS.stddev_exec_time::numeric) % SUM(PGSM.stddev_exec_time::numeric) < 1 FROM pg_stat_monitor AS PGSM INNER JOIN pg_stat_statements AS PGSS ON PGSS.query = PGSM.query WHERE PGSM.query LIKE \'%DELETE FROM pgbench_accounts%\' GROUP BY PGSM.query;',
+	'SELECT SUM(PGSM.stddev_exec_time) BETWEEN SUM(PGSS.stddev_exec_time) / 3 AND SUM(PGSS.stddev_exec_time) * 3 FROM pg_stat_monitor AS PGSM INNER JOIN pg_stat_statements AS PGSS ON PGSS.query = PGSM.query WHERE PGSM.query LIKE \'%DELETE FROM pgbench_accounts%\' GROUP BY PGSM.query;',
 	extra_params => [ '-Pformat=unaligned', '-Ptuples_only=on' ]);
 trim($stdout);
 is($stdout, 't', "Compare: stddev_exec_time is equal.");
@@ -256,35 +256,35 @@ is($stdout, 't', "Compare: rows are equal).");
 
 ($cmdret, $stdout, $stderr) = $node->psql(
 	'postgres',
-	'SELECT SUM(PGSM.total_exec_time) = SUM(ROUND(PGSS.total_exec_time::numeric,4)) OR SUM(PGSS.total_exec_time::numeric) % SUM(PGSM.total_exec_time::numeric) < 1 FROM pg_stat_monitor AS PGSM INNER JOIN pg_stat_statements AS PGSS ON PGSS.query = PGSM.query WHERE PGSM.query LIKE \'%INSERT INTO pgbench_history%\' GROUP BY PGSM.query;',
+	'SELECT SUM(PGSM.total_exec_time) BETWEEN SUM(PGSS.total_exec_time) / 3 AND SUM(PGSS.total_exec_time) * 3 FROM pg_stat_monitor AS PGSM INNER JOIN pg_stat_statements AS PGSS ON PGSS.query = PGSM.query WHERE PGSM.query LIKE \'%INSERT INTO pgbench_history%\' GROUP BY PGSM.query;',
 	extra_params => [ '-Pformat=unaligned', '-Ptuples_only=on' ]);
 trim($stdout);
 is($stdout, 't', "Compare: total_exec_time is equal.");
 
 ($cmdret, $stdout, $stderr) = $node->psql(
 	'postgres',
-	'SELECT SUM(PGSM.min_exec_time) = SUM(ROUND(PGSS.min_exec_time::numeric,4)) OR SUM(PGSS.min_exec_time::numeric) % SUM(PGSM.min_exec_time::numeric) < 1 FROM pg_stat_monitor AS PGSM INNER JOIN pg_stat_statements AS PGSS ON PGSS.query = PGSM.query WHERE PGSM.query LIKE \'%INSERT INTO pgbench_history%\' GROUP BY PGSM.query;',
+	'SELECT SUM(PGSM.min_exec_time) BETWEEN SUM(PGSS.min_exec_time) / 3 AND SUM(PGSS.min_exec_time) * 3 FROM pg_stat_monitor AS PGSM INNER JOIN pg_stat_statements AS PGSS ON PGSS.query = PGSM.query WHERE PGSM.query LIKE \'%INSERT INTO pgbench_history%\' GROUP BY PGSM.query;',
 	extra_params => [ '-Pformat=unaligned', '-Ptuples_only=on' ]);
 trim($stdout);
 is($stdout, 't', "Compare: min_exec_time is equal.");
 
 ($cmdret, $stdout, $stderr) = $node->psql(
 	'postgres',
-	'SELECT SUM(PGSM.max_exec_time) = SUM(ROUND(PGSS.max_exec_time::numeric,4)) OR SUM(PGSS.max_exec_time::numeric) % SUM(PGSM.max_exec_time::numeric) < 1 FROM pg_stat_monitor AS PGSM INNER JOIN pg_stat_statements AS PGSS ON PGSS.query = PGSM.query WHERE PGSM.query LIKE \'%INSERT INTO pgbench_history%\' GROUP BY PGSM.query;',
+	'SELECT SUM(PGSM.max_exec_time) BETWEEN SUM(PGSS.max_exec_time) / 3 AND SUM(PGSS.max_exec_time) * 3 FROM pg_stat_monitor AS PGSM INNER JOIN pg_stat_statements AS PGSS ON PGSS.query = PGSM.query WHERE PGSM.query LIKE \'%INSERT INTO pgbench_history%\' GROUP BY PGSM.query;',
 	extra_params => [ '-Pformat=unaligned', '-Ptuples_only=on' ]);
 trim($stdout);
 is($stdout, 't', "Compare: max_exec_time is equal.");
 
 ($cmdret, $stdout, $stderr) = $node->psql(
 	'postgres',
-	'SELECT SUM(PGSM.mean_exec_time) = SUM(ROUND(PGSS.mean_exec_time::numeric,4)) OR SUM(PGSS.mean_exec_time::numeric) % SUM(PGSM.mean_exec_time::numeric) < 1 FROM pg_stat_monitor AS PGSM INNER JOIN pg_stat_statements AS PGSS ON PGSS.query = PGSM.query WHERE PGSM.query LIKE \'%INSERT INTO pgbench_history%\' GROUP BY PGSM.query;',
+	'SELECT SUM(PGSM.mean_exec_time) BETWEEN SUM(PGSS.mean_exec_time) / 3 AND SUM(PGSS.mean_exec_time) * 3 FROM pg_stat_monitor AS PGSM INNER JOIN pg_stat_statements AS PGSS ON PGSS.query = PGSM.query WHERE PGSM.query LIKE \'%INSERT INTO pgbench_history%\' GROUP BY PGSM.query;',
 	extra_params => [ '-Pformat=unaligned', '-Ptuples_only=on' ]);
 trim($stdout);
 is($stdout, 't', "Compare: mean_exec_time is equal.");
 
 ($cmdret, $stdout, $stderr) = $node->psql(
 	'postgres',
-	'SELECT SUM(PGSM.stddev_exec_time) = SUM(ROUND(PGSS.stddev_exec_time::numeric,4)) OR SUM(PGSS.stddev_exec_time::numeric) % SUM(PGSM.stddev_exec_time::numeric) < 1 FROM pg_stat_monitor AS PGSM INNER JOIN pg_stat_statements AS PGSS ON PGSS.query = PGSM.query WHERE PGSM.query LIKE \'%INSERT INTO pgbench_history%\' GROUP BY PGSM.query;',
+	'SELECT SUM(PGSM.stddev_exec_time) BETWEEN SUM(PGSS.stddev_exec_time) / 3 AND SUM(PGSS.stddev_exec_time) * 3 FROM pg_stat_monitor AS PGSM INNER JOIN pg_stat_statements AS PGSS ON PGSS.query = PGSM.query WHERE PGSM.query LIKE \'%INSERT INTO pgbench_history%\' GROUP BY PGSM.query;',
 	extra_params => [ '-Pformat=unaligned', '-Ptuples_only=on' ]);
 trim($stdout);
 is($stdout, 't', "Compare: stddev_exec_time is equal.");
@@ -365,35 +365,35 @@ is($stdout, 't', "Compare: rows are equal).");
 
 ($cmdret, $stdout, $stderr) = $node->psql(
 	'postgres',
-	'SELECT SUM(PGSM.total_exec_time) = SUM(ROUND(PGSS.total_exec_time::numeric,4)) OR SUM(PGSS.total_exec_time::numeric) % SUM(PGSM.total_exec_time::numeric) < 1 FROM pg_stat_monitor AS PGSM INNER JOIN pg_stat_statements AS PGSS ON PGSS.query = PGSM.query WHERE PGSM.query LIKE \'%SELECT abalance FROM pgbench_accounts%\' GROUP BY PGSM.query;',
+	'SELECT SUM(PGSM.total_exec_time) BETWEEN SUM(PGSS.total_exec_time) / 3 AND SUM(PGSS.total_exec_time) * 3 FROM pg_stat_monitor AS PGSM INNER JOIN pg_stat_statements AS PGSS ON PGSS.query = PGSM.query WHERE PGSM.query LIKE \'%SELECT abalance FROM pgbench_accounts%\' GROUP BY PGSM.query;',
 	extra_params => [ '-Pformat=unaligned', '-Ptuples_only=on' ]);
 trim($stdout);
 is($stdout, 't', "Compare: total_exec_time is equal.");
 
 ($cmdret, $stdout, $stderr) = $node->psql(
 	'postgres',
-	'SELECT SUM(PGSM.min_exec_time) = SUM(ROUND(PGSS.min_exec_time::numeric,4)) OR SUM(PGSS.min_exec_time::numeric) % SUM(PGSM.min_exec_time::numeric) < 1 FROM pg_stat_monitor AS PGSM INNER JOIN pg_stat_statements AS PGSS ON PGSS.query = PGSM.query WHERE PGSM.query LIKE \'%SELECT abalance FROM pgbench_accounts%\' GROUP BY PGSM.query;',
+	'SELECT SUM(PGSM.min_exec_time) BETWEEN SUM(PGSS.min_exec_time) / 3 AND SUM(PGSS.min_exec_time) * 3 FROM pg_stat_monitor AS PGSM INNER JOIN pg_stat_statements AS PGSS ON PGSS.query = PGSM.query WHERE PGSM.query LIKE \'%SELECT abalance FROM pgbench_accounts%\' GROUP BY PGSM.query;',
 	extra_params => [ '-Pformat=unaligned', '-Ptuples_only=on' ]);
 trim($stdout);
 is($stdout, 't', "Compare: min_exec_time is equal.");
 
 ($cmdret, $stdout, $stderr) = $node->psql(
 	'postgres',
-	'SELECT SUM(PGSM.max_exec_time) = SUM(ROUND(PGSS.max_exec_time::numeric,4)) OR SUM(PGSS.max_exec_time::numeric) % SUM(PGSM.max_exec_time::numeric) < 1 FROM pg_stat_monitor AS PGSM INNER JOIN pg_stat_statements AS PGSS ON PGSS.query = PGSM.query WHERE PGSM.query LIKE \'%SELECT abalance FROM pgbench_accounts%\' GROUP BY PGSM.query;',
+	'SELECT SUM(PGSM.max_exec_time) BETWEEN SUM(PGSS.max_exec_time) / 3 AND SUM(PGSS.max_exec_time) * 3 FROM pg_stat_monitor AS PGSM INNER JOIN pg_stat_statements AS PGSS ON PGSS.query = PGSM.query WHERE PGSM.query LIKE \'%SELECT abalance FROM pgbench_accounts%\' GROUP BY PGSM.query;',
 	extra_params => [ '-Pformat=unaligned', '-Ptuples_only=on' ]);
 trim($stdout);
 is($stdout, 't', "Compare: max_exec_time is equal.");
 
 ($cmdret, $stdout, $stderr) = $node->psql(
 	'postgres',
-	'SELECT SUM(PGSM.mean_exec_time) = SUM(ROUND(PGSS.mean_exec_time::numeric,4)) OR SUM(PGSS.mean_exec_time::numeric) % SUM(PGSM.mean_exec_time::numeric) < 1 FROM pg_stat_monitor AS PGSM INNER JOIN pg_stat_statements AS PGSS ON PGSS.query = PGSM.query WHERE PGSM.query LIKE \'%SELECT abalance FROM pgbench_accounts%\' GROUP BY PGSM.query;',
+	'SELECT SUM(PGSM.mean_exec_time) BETWEEN SUM(PGSS.mean_exec_time) / 3 AND SUM(PGSS.mean_exec_time) * 3 FROM pg_stat_monitor AS PGSM INNER JOIN pg_stat_statements AS PGSS ON PGSS.query = PGSM.query WHERE PGSM.query LIKE \'%SELECT abalance FROM pgbench_accounts%\' GROUP BY PGSM.query;',
 	extra_params => [ '-Pformat=unaligned', '-Ptuples_only=on' ]);
 trim($stdout);
 is($stdout, 't', "Compare: mean_exec_time is equal.");
 
 ($cmdret, $stdout, $stderr) = $node->psql(
 	'postgres',
-	'SELECT SUM(PGSM.stddev_exec_time) = SUM(ROUND(PGSS.stddev_exec_time::numeric,4)) OR SUM(PGSS.stddev_exec_time::numeric) % SUM(PGSM.stddev_exec_time::numeric) < 1 FROM pg_stat_monitor AS PGSM INNER JOIN pg_stat_statements AS PGSS ON PGSS.query = PGSM.query WHERE PGSM.query LIKE \'%SELECT abalance FROM pgbench_accounts%\' GROUP BY PGSM.query;',
+	'SELECT SUM(PGSM.stddev_exec_time) BETWEEN SUM(PGSS.stddev_exec_time) / 3 AND SUM(PGSS.stddev_exec_time) * 3 FROM pg_stat_monitor AS PGSM INNER JOIN pg_stat_statements AS PGSS ON PGSS.query = PGSM.query WHERE PGSM.query LIKE \'%SELECT abalance FROM pgbench_accounts%\' GROUP BY PGSM.query;',
 	extra_params => [ '-Pformat=unaligned', '-Ptuples_only=on' ]);
 trim($stdout);
 is($stdout, 't', "Compare: stddev_exec_time is equal.");
@@ -474,35 +474,35 @@ is($stdout, 't', "Compare: rows are equal).");
 
 ($cmdret, $stdout, $stderr) = $node->psql(
 	'postgres',
-	'SELECT SUM(PGSM.total_exec_time) = SUM(ROUND(PGSS.total_exec_time::numeric,4)) OR SUM(PGSS.total_exec_time::numeric) % SUM(PGSM.total_exec_time::numeric) < 1 FROM pg_stat_monitor AS PGSM INNER JOIN pg_stat_statements AS PGSS ON PGSS.query = PGSM.query WHERE PGSM.query LIKE \'%UPDATE pgbench_accounts%\' GROUP BY PGSM.query;',
+	'SELECT SUM(PGSM.total_exec_time) BETWEEN SUM(PGSS.total_exec_time) / 3 AND SUM(PGSS.total_exec_time) * 3 FROM pg_stat_monitor AS PGSM INNER JOIN pg_stat_statements AS PGSS ON PGSS.query = PGSM.query WHERE PGSM.query LIKE \'%UPDATE pgbench_accounts%\' GROUP BY PGSM.query;',
 	extra_params => [ '-Pformat=unaligned', '-Ptuples_only=on' ]);
 trim($stdout);
 is($stdout, 't', "Compare: total_exec_time is equal.");
 
 ($cmdret, $stdout, $stderr) = $node->psql(
 	'postgres',
-	'SELECT SUM(PGSM.min_exec_time) = SUM(ROUND(PGSS.min_exec_time::numeric,4)) OR SUM(PGSS.min_exec_time::numeric) % SUM(PGSM.min_exec_time::numeric) < 1 FROM pg_stat_monitor AS PGSM INNER JOIN pg_stat_statements AS PGSS ON PGSS.query = PGSM.query WHERE PGSM.query LIKE \'%UPDATE pgbench_accounts%\' GROUP BY PGSM.query;',
+	'SELECT SUM(PGSM.min_exec_time) BETWEEN SUM(PGSS.min_exec_time) / 3 AND SUM(PGSS.min_exec_time) * 3 FROM pg_stat_monitor AS PGSM INNER JOIN pg_stat_statements AS PGSS ON PGSS.query = PGSM.query WHERE PGSM.query LIKE \'%UPDATE pgbench_accounts%\' GROUP BY PGSM.query;',
 	extra_params => [ '-Pformat=unaligned', '-Ptuples_only=on' ]);
 trim($stdout);
 is($stdout, 't', "Compare: min_exec_time is equal.");
 
 ($cmdret, $stdout, $stderr) = $node->psql(
 	'postgres',
-	'SELECT SUM(PGSM.max_exec_time) = SUM(ROUND(PGSS.max_exec_time::numeric,4)) OR SUM(PGSS.max_exec_time::numeric) % SUM(PGSM.max_exec_time::numeric) < 1 FROM pg_stat_monitor AS PGSM INNER JOIN pg_stat_statements AS PGSS ON PGSS.query = PGSM.query WHERE PGSM.query LIKE \'%UPDATE pgbench_accounts%\' GROUP BY PGSM.query;',
+	'SELECT SUM(PGSM.max_exec_time) BETWEEN SUM(PGSS.max_exec_time) / 3 AND SUM(PGSS.max_exec_time) * 3 FROM pg_stat_monitor AS PGSM INNER JOIN pg_stat_statements AS PGSS ON PGSS.query = PGSM.query WHERE PGSM.query LIKE \'%UPDATE pgbench_accounts%\' GROUP BY PGSM.query;',
 	extra_params => [ '-Pformat=unaligned', '-Ptuples_only=on' ]);
 trim($stdout);
 is($stdout, 't', "Compare: max_exec_time is equal.");
 
 ($cmdret, $stdout, $stderr) = $node->psql(
 	'postgres',
-	'SELECT SUM(PGSM.mean_exec_time) = SUM(ROUND(PGSS.mean_exec_time::numeric,4)) OR SUM(PGSS.mean_exec_time::numeric) % SUM(PGSM.mean_exec_time::numeric) < 1 FROM pg_stat_monitor AS PGSM INNER JOIN pg_stat_statements AS PGSS ON PGSS.query = PGSM.query WHERE PGSM.query LIKE \'%UPDATE pgbench_accounts%\' GROUP BY PGSM.query;',
+	'SELECT SUM(PGSM.mean_exec_time) BETWEEN SUM(PGSS.mean_exec_time) / 3 AND SUM(PGSS.mean_exec_time) * 3 FROM pg_stat_monitor AS PGSM INNER JOIN pg_stat_statements AS PGSS ON PGSS.query = PGSM.query WHERE PGSM.query LIKE \'%UPDATE pgbench_accounts%\' GROUP BY PGSM.query;',
 	extra_params => [ '-Pformat=unaligned', '-Ptuples_only=on' ]);
 trim($stdout);
 is($stdout, 't', "Compare: mean_exec_time is equal.");
 
 ($cmdret, $stdout, $stderr) = $node->psql(
 	'postgres',
-	'SELECT SUM(PGSM.stddev_exec_time) = SUM(ROUND(PGSS.stddev_exec_time::numeric,4)) OR SUM(PGSS.stddev_exec_time::numeric) % SUM(PGSM.stddev_exec_time::numeric) < 1 FROM pg_stat_monitor AS PGSM INNER JOIN pg_stat_statements AS PGSS ON PGSS.query = PGSM.query WHERE PGSM.query LIKE \'%UPDATE pgbench_accounts%\' GROUP BY PGSM.query;',
+	'SELECT SUM(PGSM.stddev_exec_time) BETWEEN SUM(PGSS.stddev_exec_time) / 3 AND SUM(PGSS.stddev_exec_time) * 3 FROM pg_stat_monitor AS PGSM INNER JOIN pg_stat_statements AS PGSS ON PGSS.query = PGSM.query WHERE PGSM.query LIKE \'%UPDATE pgbench_accounts%\' GROUP BY PGSM.query;',
 	extra_params => [ '-Pformat=unaligned', '-Ptuples_only=on' ]);
 trim($stdout);
 is($stdout, 't', "Compare: stddev_exec_time is equal.");

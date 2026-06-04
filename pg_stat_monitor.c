@@ -119,6 +119,49 @@ static bool system_init = false;
 static struct rusage rusage_start;
 static struct rusage rusage_end;
 
+/*
+ * Per-execution measurement, pushed by pgsm_ExecutorStart() and consumed
+ * by pgsm_ExecutorEnd(). Replaces our former dependence on
+ * queryDesc->totaltime, which has been observed to contain invalid data
+ * by the time pgsm_ExecutorEnd() reads it on at least one PG18 + RDS
+ * deployment. The corruption mechanism is unconfirmed; computing our
+ * own values closes the dependency regardless of cause.
+ *
+ * The accumulators are filled by pgsm_ExecutorRun() and pgsm_ExecutorFinish()
+ * by diffing pgBufferUsage / pgWalUsage / INSTR_TIME across each call,
+ * matching the scope queryDesc->totaltime used to cover. That keeps
+ * cursor idle time out of total_time (which Start->End wall clock would
+ * otherwise pick up) and stays comparable to pg_stat_statements.
+ *
+ * The stack lives in TopMemoryContext so it survives any context the
+ * executor might tear down. End-of-xact cleanup empties it in case an
+ * error leaves orphans behind. nesting_level_at_push lets Run/Finish
+ * recognise their matching frame without LIFO assumptions about other
+ * extensions' nested hooks.
+ */
+typedef struct PgsmExecMeasure
+{
+	int			nesting_level_at_push;
+	instr_time	total_time;
+	BufferUsage total_bufusage;
+	WalUsage	total_walusage;
+} PgsmExecMeasure;
+
+static List *pgsm_exec_stack = NIL;
+
+static inline PgsmExecMeasure *
+pgsm_active_measure(void)
+{
+	PgsmExecMeasure *m;
+
+	if (pgsm_exec_stack == NIL)
+		return NULL;
+	m = (PgsmExecMeasure *) llast(pgsm_exec_stack);
+	if (m->nesting_level_at_push != nesting_level)
+		return NULL;
+	return m;
+}
+
 /* Application name and length; set each time when an entry is created locally */
 static char app_name[APPLICATIONNAME_LEN];
 static int	app_name_len;
@@ -204,6 +247,7 @@ static pgsmEntry *pgsm_get_entry_for_query(int64 queryid, PlanInfo *plan_info, c
 static int64 get_pgsm_query_id_hash(const char *norm_query, int len);
 
 static void pgsm_cleanup_callback(void *arg);
+static void pgsm_exec_xact_cleanup(XactEvent event, void *arg);
 static void pgsm_store_error(const char *query, ErrorData *edata);
 
 /*---- Local variables ----*/
@@ -318,6 +362,8 @@ _PG_init(void)
 	emit_log_hook = HOOK(pgsm_emit_log_hook);
 	prev_ExecutorCheckPerms_hook = ExecutorCheckPerms_hook;
 	ExecutorCheckPerms_hook = HOOK(pgsm_ExecutorCheckPerms);
+
+	RegisterXactCallback(pgsm_exec_xact_cleanup, NULL);
 
 	nested_queryids = (int64 *) malloc(sizeof(int64) * max_stack_depth);
 	nested_query_txts = (char **) calloc(max_stack_depth, sizeof(char *));
@@ -525,19 +571,25 @@ pgsm_ExecutorStart(QueryDesc *queryDesc, int eflags)
 	if (pgsm_enabled(nesting_level) &&
 		queryDesc->plannedstmt->queryId != INT64CONST(0))
 	{
-		/*
-		 * Set up to track total elapsed time in ExecutorRun.  Make sure the
-		 * space is allocated in the per-query context so it will go away at
-		 * ExecutorEnd.
-		 */
-		if (queryDesc->totaltime == NULL)
-		{
-			MemoryContext oldcxt;
+		PgsmExecMeasure *m;
+		MemoryContext oldcxt;
 
-			oldcxt = MemoryContextSwitchTo(queryDesc->estate->es_query_cxt);
-			queryDesc->totaltime = InstrAlloc(1, INSTRUMENT_ALL, false);
-			MemoryContextSwitchTo(oldcxt);
-		}
+		/*
+		 * Push a zero-initialised measurement frame. pgsm_ExecutorRun()
+		 * and pgsm_ExecutorFinish() snapshot pgBufferUsage / pgWalUsage /
+		 * INSTR_TIME on entry and add the diff into these accumulators
+		 * on exit. Parallel worker contributions to bufusage / walusage
+		 * are already folded into the globals before ExecutorRun returns
+		 * via ExecParallelFinish() inside ExecShutdownNode().
+		 *
+		 * The frame lives in TopMemoryContext so it outlives anything the
+		 * executor's per-query context teardown could reach.
+		 */
+		oldcxt = MemoryContextSwitchTo(TopMemoryContext);
+		m = palloc0(sizeof(PgsmExecMeasure));
+		m->nesting_level_at_push = nesting_level;
+		pgsm_exec_stack = lappend(pgsm_exec_stack, m);
+		MemoryContextSwitchTo(oldcxt);
 	}
 }
 
@@ -553,10 +605,29 @@ pgsm_ExecutorRun(QueryDesc *queryDesc, ScanDirection direction, uint64 count,
 pgsm_ExecutorRun(QueryDesc *queryDesc, ScanDirection direction, uint64 count)
 #endif
 {
+	PgsmExecMeasure *m;
+	instr_time	run_start_time;
+	BufferUsage run_start_bufusage;
+	WalUsage	run_start_walusage;
+
 	if (nesting_level >= 0 && nesting_level < max_stack_depth)
 	{
 		nested_queryids[nesting_level] = queryDesc->plannedstmt->queryId;
 		nested_query_txts[nesting_level] = strdup(queryDesc->sourceText);
+	}
+
+	/*
+	 * Snapshot now and accumulate the diff on the matching frame at exit.
+	 * Match by nesting_level so a nested ExecutorRun (that pushed its own
+	 * frame, or none at all) does not double-count into our parent's
+	 * accumulator.
+	 */
+	m = pgsm_active_measure();
+	if (m)
+	{
+		INSTR_TIME_SET_CURRENT(run_start_time);
+		run_start_bufusage = pgBufferUsage;
+		run_start_walusage = pgWalUsage;
 	}
 
 	nesting_level++;
@@ -586,6 +657,16 @@ pgsm_ExecutorRun(QueryDesc *queryDesc, ScanDirection direction, uint64 count)
 				free(nested_query_txts[nesting_level]);
 			nested_query_txts[nesting_level] = NULL;
 		}
+		if (m)
+		{
+			instr_time	elapsed;
+
+			INSTR_TIME_SET_CURRENT(elapsed);
+			INSTR_TIME_SUBTRACT(elapsed, run_start_time);
+			INSTR_TIME_ADD(m->total_time, elapsed);
+			BufferUsageAccumDiff(&m->total_bufusage, &pgBufferUsage, &run_start_bufusage);
+			WalUsageAccumDiff(&m->total_walusage, &pgWalUsage, &run_start_walusage);
+		}
 	}
 	PG_CATCH();
 	{
@@ -603,11 +684,26 @@ pgsm_ExecutorRun(QueryDesc *queryDesc, ScanDirection direction, uint64 count)
 }
 
 /*
- * ExecutorFinish hook: all we need do is track nesting depth
+ * ExecutorFinish hook: track nesting depth and accumulate the finish-phase
+ * cost into the matching measurement frame, mirroring what InstrStartNode/
+ * InstrStopNode used to add to queryDesc->totaltime here.
  */
 static void
 pgsm_ExecutorFinish(QueryDesc *queryDesc)
 {
+	PgsmExecMeasure *m;
+	instr_time	finish_start_time;
+	BufferUsage finish_start_bufusage;
+	WalUsage	finish_start_walusage;
+
+	m = pgsm_active_measure();
+	if (m)
+	{
+		INSTR_TIME_SET_CURRENT(finish_start_time);
+		finish_start_bufusage = pgBufferUsage;
+		finish_start_walusage = pgWalUsage;
+	}
+
 	nesting_level++;
 
 	PG_TRY();
@@ -617,6 +713,16 @@ pgsm_ExecutorFinish(QueryDesc *queryDesc)
 		else
 			standard_ExecutorFinish(queryDesc);
 		nesting_level--;
+		if (m)
+		{
+			instr_time	elapsed;
+
+			INSTR_TIME_SET_CURRENT(elapsed);
+			INSTR_TIME_SUBTRACT(elapsed, finish_start_time);
+			INSTR_TIME_ADD(m->total_time, elapsed);
+			BufferUsageAccumDiff(&m->total_bufusage, &pgBufferUsage, &finish_start_bufusage);
+			WalUsageAccumDiff(&m->total_walusage, &pgWalUsage, &finish_start_walusage);
+		}
 	}
 	PG_CATCH();
 	{
@@ -658,6 +764,7 @@ pgsm_ExecutorEnd(QueryDesc *queryDesc)
 	PlanInfo	plan_info;
 	PlanInfo   *plan_ptr = NULL;
 	pgsmEntry  *entry = NULL;
+	PgsmExecMeasure *m = NULL;
 
 	/* Extract the plan information in case of SELECT statement */
 	if (queryDesc->operation == CMD_SELECT && pgsm_enable_query_plan)
@@ -688,23 +795,30 @@ pgsm_ExecutorEnd(QueryDesc *queryDesc)
 		MemoryContextSwitchTo(oldctx);
 	}
 
-	if (queryId != INT64CONST(0) && queryDesc->totaltime && pgsm_enabled(nesting_level))
+	/*
+	 * Pop the matching measurement pushed in pgsm_ExecutorStart(). Gate
+	 * the pop with the same condition Start used to push, so nested calls
+	 * that did not push (pgsm_track = top) do not pop the outer frame.
+	 */
+	if (queryId != INT64CONST(0) && pgsm_enabled(nesting_level) &&
+		pgsm_exec_stack != NIL)
+	{
+		m = (PgsmExecMeasure *) llast(pgsm_exec_stack);
+		pgsm_exec_stack = list_delete_last(pgsm_exec_stack);
+	}
+
+	if (m != NULL)
 	{
 		entry = pgsm_get_entry_for_query(queryId, plan_ptr, (char *) queryDesc->sourceText, strlen(queryDesc->sourceText), true, queryDesc->operation);
 		if (!entry)
 		{
 			elog(DEBUG2, "[pg_stat_monitor] pgsm_ExecutorEnd: Failed to find entry for [" INT64_FORMAT "] %s.", queryId, queryDesc->sourceText);
+			pfree(m);
 			return;
 		}
 
 		if (entry->key.planid == 0)
 			entry->key.planid = (plan_ptr) ? plan_ptr->planid : 0;
-
-		/*
-		 * Make sure stats accumulation is done.  (Note: it's okay if several
-		 * levels of hook all do this.)
-		 */
-		InstrEndLoop(queryDesc->totaltime);
 
 		sys_info.utime = 0;
 		sys_info.stime = 0;
@@ -727,10 +841,10 @@ pgsm_ExecutorEnd(QueryDesc *queryDesc)
 						  &sys_info,	/* SysInfo */
 						  NULL, /* ErrorInfo */
 						  0,	/* plan_total_time */
-						  queryDesc->totaltime->total * 1000.0, /* exec_total_time */
+						  INSTR_TIME_GET_MILLISEC(m->total_time),	/* exec_total_time */
 						  queryDesc->estate->es_processed,	/* rows */
-						  &queryDesc->totaltime->bufusage,	/* bufusage */
-						  &queryDesc->totaltime->walusage,	/* walusage */
+						  &m->total_bufusage,	/* bufusage */
+						  &m->total_walusage,	/* walusage */
 #if PG_VERSION_NUM >= 150000
 						  queryDesc->estate->es_jit ? &queryDesc->estate->es_jit->instr : NULL, /* jitusage */
 #else
@@ -749,6 +863,9 @@ pgsm_ExecutorEnd(QueryDesc *queryDesc)
 		pgsm_store(entry);
 	}
 
+	if (m)
+		pfree(m);
+
 	if (prev_ExecutorEnd)
 		prev_ExecutorEnd(queryDesc);
 	else
@@ -757,6 +874,31 @@ pgsm_ExecutorEnd(QueryDesc *queryDesc)
 	pgsm_delete_entry(queryDesc->plannedstmt->queryId);
 
 	num_relations = 0;
+}
+
+/*
+ * End-of-xact cleanup for the executor measurement stack.
+ *
+ * The Start/End hooks normally pair off, but an error between them can
+ * leave a frame behind. Drop everything still on the stack so a backend
+ * surviving many failed queries does not accumulate leaked frames in
+ * TopMemoryContext.
+ */
+static void
+pgsm_exec_xact_cleanup(XactEvent event, void *arg)
+{
+	if (event != XACT_EVENT_COMMIT &&
+		event != XACT_EVENT_ABORT &&
+		event != XACT_EVENT_PARALLEL_COMMIT &&
+		event != XACT_EVENT_PARALLEL_ABORT &&
+		event != XACT_EVENT_PREPARE)
+		return;
+
+	if (pgsm_exec_stack != NIL)
+	{
+		list_free_deep(pgsm_exec_stack);
+		pgsm_exec_stack = NIL;
+	}
 }
 
 static bool
